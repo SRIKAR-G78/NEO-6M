@@ -1,9 +1,19 @@
 // src/App.js - Updated Version
 import React, { useState, useEffect, useRef } from 'react';
 import Dashboard from './Components/Dashboard';
+import KalmanPage from './Components/KalmanPage';
+import Welcome from './Components/Welcome';
 import './Styles/App.css';
 
 function App() {
+  // Load dashboard state from localStorage on initial render
+  const [showDashboard, setShowDashboard] = useState(() => {
+    const saved = localStorage.getItem('showDashboard');
+    return saved !== null ? JSON.parse(saved) : false; // Default: false (show Welcome first)
+  });
+  const [showKalman, setShowKalman] = useState(false);
+  const [isBackendActive, setIsBackendActive] = useState(false);
+  
   const [gpsData, setGpsData] = useState({
     latitude: '0.000000',
     longitude: '0.000000',
@@ -54,6 +64,7 @@ function App() {
         websocket.onmessage = (event) => {
           try {
             const data = JSON.parse(event.data);
+            console.log('GPS Data received from backend:', data);
             setGpsData(prev => ({ ...prev, ...data, connection: 'connected' }));
           } catch (error) {
             console.error('Error parsing WebSocket message:', error);
@@ -79,6 +90,17 @@ function App() {
 
     // start connection only after backend health check succeeds
     let cancelled = false;
+
+    // Only start connection if backend is active
+    if (!isBackendActive) {
+      return () => {
+        if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+        if (wsRef.current) {
+          try { wsRef.current.close(); } catch (e) {}
+        }
+        cancelled = true;
+      };
+    }
 
     async function waitAndConnect() {
       const MAX_HEALTH_ATTEMPTS = 6;
@@ -116,7 +138,7 @@ function App() {
       }
       cancelled = true;
     };
-  }, []);
+  }, [isBackendActive]);
 
   // Fallback to demo data if no connection
   useEffect(() => {
@@ -154,12 +176,71 @@ function App() {
     };
   }, [gpsData.connection]);
 
+  const handleWelcome = () => {
+    setShowDashboard(true);
+    setIsBackendActive(true);
+    localStorage.setItem('showDashboard', JSON.stringify(true));
+  };
+
+  // Navigate back to Welcome without disconnecting backend (preserve connection)
+  const handleNavigateBack = () => {
+    setShowDashboard(false);
+    localStorage.setItem('showDashboard', JSON.stringify(false));
+    // do not change isBackendActive or close WebSocket
+  };
+
+  const handleDisconnect = () => {
+    setShowDashboard(false);
+    setIsBackendActive(false);
+    localStorage.setItem('showDashboard', JSON.stringify(false));
+    setGpsData(prev => ({
+      ...prev,
+      connection: 'disconnected'
+    }));
+    // Close WebSocket
+    if (wsRef.current) {
+      try {
+        wsRef.current.close();
+      } catch (e) {}
+    }
+  };
+
+  const handleOpenKalman = () => setShowKalman(true);
+  const handleCloseKalman = () => setShowKalman(false);
+
+  const handleStartConnection = () => {
+    setIsBackendActive(true);
+  };
+
+  const handleStopConnection = () => {
+    setIsBackendActive(false);
+    setGpsData(prev => ({
+      ...prev,
+      connection: 'disconnected'
+    }));
+    if (wsRef.current) {
+      try {
+        wsRef.current.close();
+      } catch (e) {}
+    }
+  };
+
   return (
     <div className="App">
-      <div className="connection-banner" data-status={gpsData.connection}>
-        Status: {gpsData.connection.toUpperCase()}
-      </div>
-      <Dashboard gpsData={gpsData} />
+      {!showDashboard ? (
+        <Welcome onWelcome={handleWelcome} />
+      ) : (
+        <>
+          <div className="connection-banner" data-status={gpsData.connection}>
+            Status: {gpsData.connection.toUpperCase()}
+          </div>
+          {!showKalman ? (
+            <Dashboard gpsData={gpsData} onDisconnect={handleDisconnect} onNavigateBack={handleNavigateBack} onOpenKalman={handleOpenKalman} onStartConnection={handleStartConnection} onStopConnection={handleStopConnection} isBackendActive={isBackendActive} />
+          ) : (
+            <KalmanPage gpsData={gpsData} onBack={handleCloseKalman} />
+          )}
+        </>
+      )}
     </div>
   );
 }

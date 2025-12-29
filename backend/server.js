@@ -1,14 +1,44 @@
 const WebSocket = require('ws');
 const express = require('express');
 const http = require('http');
+const mongoose = require('mongoose');
 // SerialPort and parser will be required dynamically inside tryInitSerial()
 let SerialPort = null;
 let ReadlineParser = null;
 
 const cors = require('cors');
+const GPSData = require('./gpsModel');
 
 const app = express();
 app.use(cors());
+
+// Load environment variables and connect to MongoDB
+require('dotenv').config();
+
+const mongoUri = process.env.MONGO_URI || 'mongodb://localhost:27017/gpsdb';
+
+console.log('🔗 Connecting to MongoDB:', mongoUri.substring(0, 50) + '...');
+
+mongoose.connect(mongoUri, {
+  retryWrites: true,
+  w: 'majority'
+});
+
+mongoose.connection.on('connecting', () => {
+  console.log('🔄 Connecting to MongoDB...');
+});
+
+mongoose.connection.on('connected', () => {
+  console.log('✅ MongoDB connected');
+});
+
+mongoose.connection.on('error', err => {
+  console.error('❌ MongoDB connection error:', err.message);
+});
+
+mongoose.connection.on('disconnected', () => {
+  console.warn('⚠️  MongoDB disconnected');
+});
 
 // Ensure explicit CORS response for health and preflight in case middleware is skipped
 app.use((req, res, next) => {
@@ -23,14 +53,7 @@ app.use((req, res, next) => {
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-console.log('WebSocket server attached to http server');
-
-// Log upgrade requests to help debug WebSocket handshake attempts
-server.on('upgrade', (req, socket, head) => {
-  try {
-    console.log('HTTP upgrade request:', req.method, req.url, 'from', req.socket.remoteAddress);
-  } catch (e) {}
-});
+console.log('🚀 WebSocket server attached to http server');
 
 server.on('error', (err) => {
   console.error('HTTP server error:', err && err.stack ? err.stack : err);
@@ -48,11 +71,67 @@ app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok' });
 });
 
+// Disconnect endpoint to close Arduino connection
+app.post('/disconnect', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  try {
+    console.log('🔴 Disconnect request received');
+    
+    // Close serial port if open
+    if (port && port.isOpen) {
+      port.close((err) => {
+        if (err) {
+          console.error('❌ Error closing serial port:', err.message);
+        } else {
+          console.log('✅ Serial port closed');
+        }
+      });
+    }
+    
+    // Close WebSocket connections
+    wss.clients.forEach((client) => {
+      if (client.readyState === WebSocket.OPEN) {
+        client.close(1000, 'Server disconnect requested');
+      }
+    });
+    console.log('✅ All WebSocket clients disconnected');
+    
+    res.status(200).json({ status: 'disconnected', message: 'Arduino disconnected successfully' });
+  } catch (err) {
+    console.error('❌ Error during disconnect:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Connect endpoint to start Arduino connection
+app.post('/connect', async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  try {
+    console.log('🟢 Connect request received');
+    
+    // Reinitialize serial port
+    const parser = await tryInitSerial();
+    if (parser) {
+      console.log('✅ Serial port reconnected successfully');
+      // Set up the parser with the new connection
+      setupSerialParser(parser);
+      res.status(200).json({ status: 'connected', message: 'Arduino connected successfully' });
+    } else {
+      console.warn('⚠️  Could not reconnect to serial port, using mock data');
+      res.status(200).json({ status: 'connected', message: 'Connected (mock mode)' });
+    }
+  } catch (err) {
+    console.error('❌ Error during connect:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Serial port config (can be overridden with env var SERIAL_PORT)
 const PREFERRED_PORT = process.env.SERIAL_PORT || 'COM3';
 const BAUD_RATE = parseInt(process.env.BAUD_RATE, 10) || 9600;
 
 let parser = null;
+let port = null; // global serial port reference so /disconnect can close it
 let mockInterval = null;
 let lastBroadcastJson = null;
 let lastRawInput = null; // Track last raw input to deduplicate
@@ -97,31 +176,104 @@ async function tryInitSerial() {
     }
 
     console.log(`Opening serial port: ${selected} @ ${BAUD_RATE}`);
-    const port = new SerialPort({ path: selected, baudRate: BAUD_RATE, autoOpen: true });
-    const rp = port.pipe(new ReadlineParser({ delimiter: '\n' }));
+    
+    try {
+      port = new SerialPort({ path: selected, baudRate: BAUD_RATE, autoOpen: true });
+      const rp = port.pipe(new ReadlineParser({ delimiter: '\n' }));
 
-    port.on('error', (err) => {
-      console.error('Serial port error:', err.message || err);
-    });
+      port.on('error', (err) => {
+        console.error('Serial port error:', err.message || err);
+      });
 
-    return rp;
+      return rp;
+    } catch (portErr) {
+      console.error(`❌ Failed to open ${selected}:`, portErr.message || portErr);
+      
+      // Try fallback to first available port if preferred port fails
+      if (available.length > 0 && available[0].toLowerCase() !== selected.toLowerCase()) {
+        console.log(`🔄 Trying fallback port: ${available[0]}`);
+        try {
+          port = new SerialPort({ path: available[0], baudRate: BAUD_RATE, autoOpen: true });
+          const rp = port.pipe(new ReadlineParser({ delimiter: '\n' }));
+          
+          port.on('error', (err) => {
+            console.error('Fallback serial port error:', err.message || err);
+          });
+          
+          return rp;
+        } catch (fallbackErr) {
+          console.error(`❌ Fallback port also failed:`, fallbackErr.message || fallbackErr);
+          return null;
+        }
+      }
+      return null;
+    }
   } catch (err) {
     console.error('Error initializing serial port:', err && err.message ? err.message : err);
     return null;
   }
 }
+// Save GPS data to MongoDB with TTL auto-delete
+async function saveGPSDataToDB(gpsData) {
+  try {
+    if (!gpsData || gpsData.source === 'raw') return;
+    
+    // Check if MongoDB is connected (readyState 1 = connected)
+    if (mongoose.connection.readyState !== 1) {
+      console.log('⚠️  MongoDB not ready, skipping GPS save');
+      return;
+    }
+    
+    // Check if collection has reached 45 records
+    const count = await GPSData.countDocuments();
+    if (count >= 45) {
+      await GPSData.deleteMany({});
+      console.log('🔄 Collection reached 45 records, cleared all. Restarting...');
+    }
+    
+    const gpsRecord = new GPSData({
+      latitude: gpsData.latitude,
+      longitude: gpsData.longitude,
+      altitude: gpsData.altitude,
+      satellites: gpsData.satellites,
+      hdop: gpsData.hdop,
+      speed: gpsData.speed,
+      course: gpsData.course,
+      date: gpsData.date,
+      time: gpsData.time,
+      fix: gpsData.fix,
+      source: gpsData.source
+    });
+    
+    await gpsRecord.save();
+    console.log('📦 GPS saved to DB (auto-deletes in 1 minute)');
+  } catch (err) {
+    console.error('❌ Error saving GPS data to DB:', err.message);
+  }
+}
 
-// Broadcast helper (sends to all connected clients)
 function broadcastToClients(obj) {
   if (!obj) return;
+  // Do not broadcast raw/noise lines to clients
+  if (obj.source === 'raw') return;
   const msg = JSON.stringify(obj);
   // Deduplicate identical consecutive broadcasts to reduce noise
-  if (msg === lastBroadcastJson) return;
+  if (msg === lastBroadcastJson) {
+    console.log('[BROADCAST] Skipped duplicate');
+    return;
+  }
   lastBroadcastJson = msg;
-  console.log('Broadcasting to clients:', msg);
+  console.log('✅ Broadcasting to clients:', msg.substring(0, 100) + '...');
+  let sentCount = 0;
   wss.clients.forEach(client => {
-    if (client.readyState === WebSocket.OPEN) client.send(msg);
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(msg);
+      sentCount++;
+    }
   });
+  console.log(`   Sent to ${sentCount} client(s)`);
+  // Save GPS data to MongoDB with auto-delete after 1 minute
+  saveGPSDataToDB(obj);
 }
 
 // Compute approximate local time and timezone offset from longitude
@@ -211,7 +363,7 @@ function nmeaToDecimal(coord, hemi) {
 // Buffer for labeled key:value serial outputs
 let labeledBuffer = {};
 let labeledLastBroadcast = 0; // timestamp of last broadcast
-const LABELED_BROADCAST_INTERVAL = 1000; // broadcast every 1s if we have lat/lon
+const LABELED_BROADCAST_INTERVAL = 2000; // broadcast every 2s if we have lat/lon
 let lastBroadcastedStr = null;
 
 function parseGPSData(rawData) {
@@ -364,8 +516,11 @@ function parseGPSData(rawData) {
         const out = { ...labeledBuffer };
         labeledLastBroadcast = now;
 
-        // Normalize HDOP if it looks scaled (e.g., 98 -> 0.98)
-        if (out.hdop != null && out.hdop > 10) out.hdop = +(out.hdop / 100).toFixed(2);
+        // Normalize HDOP if it looks scaled (e.g., 870 -> 8.70, 98 -> 0.98)
+        if (out.hdop != null && out.hdop > 10) {
+          out.hdop = +(out.hdop / 100).toFixed(2);
+          console.log(`[HDOP NORMALIZED] ${out.hdop}`);
+        }
 
         // Normalize time/date if needed (simple heuristics)
         if (out.date && /^[0-9]{6}$/.test(String(out.date))) {
@@ -418,7 +573,7 @@ function parseGPSData(rawData) {
         }
         lastBroadcastedStr = finalStr;
 
-        console.log(`[PARSED LABELED] Lat: ${out.latitude}, Lon: ${out.longitude}, Sats: ${out.satellites}, Alt: ${out.altitude}m, HDOP: ${out.hdop}`);
+        console.log(`[PARSED LABELED] Lat: ${out.latitude}, Lon: ${out.longitude}, Sats: ${out.satellites}, Alt: ${out.altitude}m, HDOP: ${out.hdop}, Speed: ${out.speed}km/h`);
         return finalObj;
       }
     }
@@ -428,7 +583,39 @@ function parseGPSData(rawData) {
   }
 
   // Fallback: if the rawData looks numeric or simple, return as raw
+  // Filter out common noise/separator lines (e.g., '-----', '___') and very short lines
+  if (/^[\-_=\s]{2,}$/.test(s) || s.length < 3) return null;
+
   return { source: 'raw', raw: s };
+}
+
+// Function to setup serial parser with event listeners
+function setupSerialParser(newParser) {
+  if (!newParser) return;
+  
+  // Remove old listeners if they exist
+  if (parser) {
+    parser.removeAllListeners('data');
+  }
+  
+  // Set the new parser
+  parser = newParser;
+  
+  // Add data listener for broadcasting
+  parser.on('data', (data) => {
+    try {
+      const gpsData = parseGPSData(data);
+      broadcastToClients(gpsData);
+    } catch (err) {
+      console.error('Error parsing/broadcasting GPS data:', err);
+    }
+  });
+  
+  // Clear mock interval if it was running
+  if (mockInterval) {
+    clearInterval(mockInterval);
+    mockInterval = null;
+  }
 }
 
 server.listen(8080, () => {
@@ -440,9 +627,21 @@ server.listen(8080, () => {
   parser = await tryInitSerial();
 
   if (!parser) {
-    // Periodically broadcast mock GPS data to all connected clients
+    // Periodically broadcast a simple mock GPS object to all connected clients
     mockInterval = setInterval(() => {
-      const mock = parseGPSData('');
+      const mock = {
+        source: 'mock',
+        latitude: 37.7749,
+        longitude: -122.4194,
+        altitude: null,
+        satellites: null,
+        hdop: null,
+        speed: null,
+        course: null,
+        date: null,
+        time: null,
+        fix: null
+      };
       broadcastToClients(mock);
     }, 2000);
   } else {

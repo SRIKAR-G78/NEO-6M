@@ -5,12 +5,77 @@ import SatelliteVisualizer from './SatelliteVisualizer';
 import MapView from './MapView';
 import ConnectionStatus from './ConnectionStatus';
 
-const Dashboard = ({ gpsData }) => {
+const Dashboard = ({ gpsData, onDisconnect, onOpenKalman, onNavigateBack }) => {
+  const handleBack = () => {
+    if (window.confirm('Are you sure you want to go back to the Welcome page?')) {
+      // Navigate back to welcome without disconnecting backend
+      if (onNavigateBack) {
+        onNavigateBack();
+      } else if (onDisconnect) {
+        // Fallback to previous behaviour if no navigate handler provided
+        onDisconnect();
+      }
+    }
+  };
+
+  const handleDownloadRawData = () => {
+    const csvData = [
+      ['Timestamp', 'Latitude', 'Longitude', 'Altitude (m)', 'Speed (km/h)', 'Course (°)', 'HDOP', 'Satellites', 'Fix', 'Timezone'],
+      [
+        new Date().toISOString(),
+        gpsData.latitude,
+        gpsData.longitude,
+        gpsData.altitude,
+        gpsData.speed,
+        gpsData.course,
+        gpsData.hdop,
+        gpsData.satellites,
+        gpsData.fix,
+        gpsData.timezone
+      ]
+    ];
+    const csvContent = csvData.map(row => row.map(cell => `"${cell}"`).join(',')).join('\n');
+    const blob = new Blob([csvContent], { type: 'text/csv' });
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `neo-6m-gps-data-${Date.now()}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    window.URL.revokeObjectURL(url);
+  };
+
   return (
     <div className="dashboard">
       <header className="dashboard-header">
-        <h1>📡 Neo-6M GPS Dashboard</h1>
-        <ConnectionStatus fix={gpsData.fix} />
+        <div className="header-left">
+          <h1>📡 Neo-6M GPS Dashboard</h1>
+          <ConnectionStatus fix={gpsData.fix} />
+        </div>
+        <div className="header-buttons">
+          <button 
+            className="download-button" 
+            onClick={handleDownloadRawData} 
+            title="Download raw GPS data as CSV"
+          >
+            ⬇️ Download Raw Data
+          </button>
+          <button 
+            className="kalman-button" 
+            onClick={() => onOpenKalman && onOpenKalman()} 
+            title="Open Kalman View"
+          >
+            📈 Kalman View
+          </button>
+          <button 
+            className="back-button" 
+            onClick={handleBack} 
+            title="Go back to Welcome page"
+          >
+            ← Back
+          </button>
+        </div>
       </header>
 
       <div className="dashboard-grid">
